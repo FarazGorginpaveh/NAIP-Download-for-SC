@@ -13,7 +13,7 @@ from pystac_client import Client
 from planetary_computer import sign
 from multiprocessing import Pool
 
-# === CONFIGURATION ===
+# === CONFIGURATION === 
 year = 2018
 tile_shapefile = "/volumes/cchr/Fgorgin/NC_2018/NC_10km_tiles.shp"
 us_shapefile = "/volumes/cchr/Fgorgin/US shapefile/tl_2024_us_state.shp"
