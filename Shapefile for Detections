@@ -1,0 +1,362 @@
+# -*- coding: utf-8 -*-
+"""
+Create CAFO Detection Shapefiles and Maps for AL, GA, TX, and NC
+
+This script converts YOLO detection outputs from image/subtile coordinates
+to real-world UTM coordinates, saves point shapefiles, exports Google Maps
+checking CSVs, and creates transparent PNG maps.
+
+Author: Faraz Gorginpaveh
+"""
+
+import re
+from pathlib import Path
+
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from pyogrio import read_dataframe
+from shapely.geometry import Point
+
+
+# ======================================================
+# USER SETTINGS
+# ======================================================
+
+BASE_RESULTS = Path(r"D:\Project_2\Results")
+BASE_TILES = Path(r"D:\Project_2\Tiles")
+OUTPUT_DIR = Path(r"D:\Project_2\Draft\Shapefiles_All_States")
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGET_CRS = "EPSG:26916"
+SUB_SIZE = 1000  # each subtile represents 1000 m × 1000 m
+
+STATES = ["AL", "GA", "TX", "NC"]
+
+# Coordinate logic by state:
+# AL uses top-origin image row logic.
+# GA, TX, and NC use bottom-origin logic.
+STATE_LOGIC = {
+    "AL": "case2_top_origin",
+    "GA": "case1_bottom_origin",
+    "TX": "case1_bottom_origin",
+    "NC": "case1_bottom_origin",
+}
+
+CLASS_COLORS = {
+    "Beef": "#2ECC71",
+    "Dairy": "#3498DB",
+    "Poultry": "#F1C40F",
+    "Swine": "#E74C3C",
+}
+
+
+# ======================================================
+# PARSING FUNCTIONS
+# ======================================================
+
+def parse_tile_id(tile_id):
+    """
+    Extract tile row/column from tile_id.
+
+    Example:
+        tile_00_03 -> row=0, col=3
+    """
+    match = re.search(r"tile_(\d+)_(\d+)", str(tile_id))
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None, None
+
+
+def parse_image_name(image_name):
+    """
+    Extract tile and subtile row/column from YOLO image name.
+
+    Handles both formats:
+        tile_00_03_sub_06_06.jpg
+        tile_00_03_mosaic_sub_06_06.jpg
+    """
+    image_name = str(image_name)
+
+    match = re.search(r"tile_(\d+)_(\d+)_mosaic_sub_(\d+)_(\d+)", image_name)
+    if match:
+        return (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+        )
+
+    match = re.search(r"tile_(\d+)_(\d+)_sub_(\d+)_(\d+)", image_name)
+    if match:
+        return (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            int(match.group(4)),
+        )
+
+    return None, None, None, None
+
+
+# ======================================================
+# COORDINATE CONVERSION
+# ======================================================
+
+def compute_point(row, logic):
+    """
+    Convert YOLO normalized center coordinates to UTM point geometry.
+
+    Case 1:
+        sub_row = 0 starts from the bottom of the 10 km tile.
+        Used for GA, TX, NC.
+
+    Case 2:
+        sub_row = 0 starts from the top of the 10 km tile.
+        Used for AL.
+    """
+    minx, miny, maxx, maxy = row["tile_geometry"].bounds
+
+    x = minx + row["sub_col"] * SUB_SIZE + row["center_x_norm"] * SUB_SIZE
+
+    if logic == "case1_bottom_origin":
+        y = miny + row["sub_row"] * SUB_SIZE + row["center_y_norm"] * SUB_SIZE
+
+    elif logic == "case2_top_origin":
+        y = maxy - row["sub_row"] * SUB_SIZE - row["center_y_norm"] * SUB_SIZE
+
+    else:
+        raise ValueError(f"Unknown coordinate logic: {logic}")
+
+    return Point(x, y)
+
+
+# ======================================================
+# DATA PROCESSING
+# ======================================================
+
+def load_and_prepare_tiles(tiles_path):
+    """
+    Load tile shapefile, convert CRS, and extract tile row/column.
+    """
+    tiles = read_dataframe(tiles_path)
+
+    if tiles.crs is None:
+        raise ValueError(f"Tile shapefile has no CRS: {tiles_path}")
+
+    if tiles.crs.to_string() != TARGET_CRS:
+        tiles = tiles.to_crs(TARGET_CRS)
+
+    tiles[["tile_row", "tile_col"]] = tiles["tile_id"].apply(
+        lambda x: pd.Series(parse_tile_id(x))
+    )
+
+    tiles = tiles.dropna(subset=["tile_row", "tile_col"]).copy()
+    tiles["tile_row"] = tiles["tile_row"].astype(int)
+    tiles["tile_col"] = tiles["tile_col"].astype(int)
+
+    return tiles[["tile_id", "tile_row", "tile_col", "geometry"]]
+
+
+def load_and_prepare_detections(csv_path):
+    """
+    Load YOLO detections and extract tile/subtile indices from image_name.
+    """
+    df = pd.read_csv(csv_path)
+
+    df["class_name"] = df["class_name"].astype(str)
+
+    df[["tile_row", "tile_col", "sub_row", "sub_col"]] = df["image_name"].apply(
+        lambda x: pd.Series(parse_image_name(x))
+    )
+
+    df = df.dropna(
+        subset=[
+            "tile_row",
+            "tile_col",
+            "sub_row",
+            "sub_col",
+            "center_x_norm",
+            "center_y_norm",
+        ]
+    ).copy()
+
+    for col in ["tile_row", "tile_col", "sub_row", "sub_col"]:
+        df[col] = df[col].astype(int)
+
+    return df
+
+
+def create_detection_shapefile(state):
+    """
+    Create CAFO detection shapefile for one state.
+    """
+    print("\n" + "=" * 80)
+    print(f"Processing {state}")
+    print("=" * 80)
+
+    csv_path = BASE_RESULTS / f"Results_{state}" / "detections" / "all_detections_full.csv"
+    tiles_path = BASE_TILES / f"{state}_10km_tiles.shp"
+
+    state_out_dir = OUTPUT_DIR / state
+    state_out_dir.mkdir(parents=True, exist_ok=True)
+
+    shp_output = state_out_dir / f"{state}_Detections.shp"
+    csv_check_output = state_out_dir / f"{state}_Detections_google_check.csv"
+
+    print(f"Detection CSV: {csv_path}")
+    print(f"Tile shapefile: {tiles_path}")
+    print(f"Coordinate logic: {STATE_LOGIC[state]}")
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing detection CSV: {csv_path}")
+
+    if not tiles_path.exists():
+        raise FileNotFoundError(f"Missing tile shapefile: {tiles_path}")
+
+    df = load_and_prepare_detections(csv_path)
+    tiles = load_and_prepare_tiles(tiles_path)
+
+    merged = df.merge(
+        tiles[["tile_row", "tile_col", "geometry"]],
+        on=["tile_row", "tile_col"],
+        how="left",
+    )
+
+    merged = merged.rename(columns={"geometry": "tile_geometry"})
+    merged = merged.dropna(subset=["tile_geometry"]).copy()
+
+    logic = STATE_LOGIC[state]
+    merged["geometry"] = merged.apply(lambda row: compute_point(row, logic), axis=1)
+
+    keep_columns = [
+        "image_name",
+        "class_id",
+        "class_name",
+        "confidence",
+        "tile_row",
+        "tile_col",
+        "sub_row",
+        "sub_col",
+    ]
+
+    gdf = gpd.GeoDataFrame(
+        merged[keep_columns + ["geometry"]],
+        geometry="geometry",
+        crs=TARGET_CRS,
+    )
+
+    gdf.to_file(shp_output, driver="ESRI Shapefile")
+
+    # Export Google Maps checking CSV
+    gdf_ll = gdf.to_crs("EPSG:4326").copy()
+    gdf_ll["lat"] = gdf_ll.geometry.y
+    gdf_ll["lon"] = gdf_ll.geometry.x
+    gdf_ll["google_coords"] = (
+        gdf_ll["lat"].astype(str) + ", " + gdf_ll["lon"].astype(str)
+    )
+    gdf_ll["google_maps"] = (
+        "https://www.google.com/maps?q=" + gdf_ll["google_coords"]
+    )
+
+    gdf_ll.drop(columns="geometry").to_csv(csv_check_output, index=False)
+
+    print(f"Saved shapefile: {shp_output}")
+    print(f"Saved Google check CSV: {csv_check_output}")
+    print(f"Total detections exported: {len(gdf):,}")
+
+    return gdf, tiles, state_out_dir
+
+
+# ======================================================
+# MAPPING
+# ======================================================
+
+def create_state_map(state, gdf_points, tiles, state_out_dir):
+    """
+    Create transparent PNG map for one state.
+    """
+    map_output = state_out_dir / f"{state}_CAFO_Map.png"
+
+    gdf_points = gdf_points.to_crs(TARGET_CRS)
+    tiles = tiles.to_crs(TARGET_CRS)
+
+    state_outline = tiles.dissolve()
+    state_outline_smooth = state_outline.simplify(
+        tolerance=200,
+        preserve_topology=True,
+    )
+    state_boundary = state_outline_smooth.boundary
+
+    fig, ax = plt.subplots(figsize=(12, 14))
+
+    fig.patch.set_alpha(0)
+    ax.set_facecolor("none")
+
+    # Border glow
+    state_boundary.plot(
+        ax=ax,
+        color="black",
+        linewidth=6,
+        alpha=0.10,
+    )
+
+    # Main state border
+    state_boundary.plot(
+        ax=ax,
+        color="black",
+        linewidth=1.2,
+    )
+
+    # CAFO points
+    for class_name, color in CLASS_COLORS.items():
+        subset = gdf_points[gdf_points["class_name"] == class_name]
+
+        if len(subset) > 0:
+            subset.plot(
+                ax=ax,
+                markersize=7,
+                color=color,
+                alpha=0.90,
+                label=class_name,
+            )
+
+    ax.legend(
+        title="CAFO Class",
+        loc="lower right",
+        frameon=False,
+    )
+
+    ax.set_axis_off()
+    ax.set_aspect("equal", "box")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        map_output,
+        dpi=600,
+        bbox_inches="tight",
+        transparent=True,
+    )
+
+    plt.close()
+
+    print(f"Saved map: {map_output}")
+
+
+# ======================================================
+# MAIN
+# ======================================================
+
+def main():
+    for state in STATES:
+        gdf_points, tiles, state_out_dir = create_detection_shapefile(state)
+        create_state_map(state, gdf_points, tiles, state_out_dir)
+
+    print("\nAll states processed successfully.")
+    print(f"Outputs saved in: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
